@@ -57,42 +57,45 @@ export function resolveQdrantStorage(): StorageInfo {
     }
   }
 
-  try {
-    const exePath = runPs(
-      "(Get-CimInstance Win32_Process -Filter \"name='qdrant.exe'\" | Select-Object -First 1 -ExpandProperty ExecutablePath)",
-    )
-    const commandLine = runPs(
-      "(Get-CimInstance Win32_Process -Filter \"name='qdrant.exe'\" | Select-Object -First 1 -ExpandProperty CommandLine)",
-    )
+  // Windows 桌面：探测本机 qdrant.exe；服务器/Linux 跳过
+  if (process.platform === 'win32') {
+    try {
+      const exePath = runPs(
+        "(Get-CimInstance Win32_Process -Filter \"name='qdrant.exe'\" | Select-Object -First 1 -ExpandProperty ExecutablePath)",
+      )
+      const commandLine = runPs(
+        "(Get-CimInstance Win32_Process -Filter \"name='qdrant.exe'\" | Select-Object -First 1 -ExpandProperty CommandLine)",
+      )
 
-    if (exePath) {
-      const exeDir = path.dirname(exePath)
-      let storagePath = path.join(exeDir, 'storage')
-      let source = 'qdrant.exe 同目录 /storage'
+      if (exePath) {
+        const exeDir = path.dirname(exePath)
+        let storagePath = path.join(exeDir, 'storage')
+        let source = 'qdrant.exe 同目录 /storage'
 
-      const configMatch = commandLine.match(/--config(?:=|\s+)["']?([^"'\s]+)/i)
-      if (configMatch?.[1]) {
-        const configFile = path.isAbsolute(configMatch[1])
-          ? configMatch[1]
-          : path.resolve(exeDir, configMatch[1])
-        const fromConfig = readStoragePathFromConfig(configFile)
-        if (fromConfig) {
-          storagePath = fromConfig
-          source = `配置文件 ${configFile}`
+        const configMatch = commandLine.match(/--config(?:=|\s+)["']?([^"'\s]+)/i)
+        if (configMatch?.[1]) {
+          const configFile = path.isAbsolute(configMatch[1])
+            ? configMatch[1]
+            : path.resolve(exeDir, configMatch[1])
+          const fromConfig = readStoragePathFromConfig(configFile)
+          if (fromConfig) {
+            storagePath = fromConfig
+            source = `配置文件 ${configFile}`
+          }
+        }
+
+        return {
+          path: storagePath,
+          exists: fs.existsSync(storagePath),
+          source,
+          collectionsPath: path.join(storagePath, 'collections'),
+          collections: listCollectionDirs(storagePath),
+          note: `进程：${exePath}`,
         }
       }
-
-      return {
-        path: storagePath,
-        exists: fs.existsSync(storagePath),
-        source,
-        collectionsPath: path.join(storagePath, 'collections'),
-        collections: listCollectionDirs(storagePath),
-        note: `进程：${exePath}`,
-      }
+    } catch {
+      // ignore and fallback
     }
-  } catch {
-    // ignore and fallback
   }
 
   const fallbacks = [

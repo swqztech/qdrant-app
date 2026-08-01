@@ -5,16 +5,22 @@ export const DEFAULT_QDRANT_URL = '/qdrant'
 
 /**
  * 创建客户端。
- * - `/qdrant`：走 Vite 代理到 127.0.0.1:6333
+ * - `/qdrant`：同源相对路径（开发走 Vite/Express 代理；线上走反代，勿拼 6333）
  * - `http://127.0.0.1:6333`：浏览器直连（需 Qdrant 允许 CORS）
+ *
+ * 注意：js-client-rest 在 url 未带端口时会默认 port=6333。
+ * 线上 HTTPS 的 location.origin 通常无端口，必须显式 port=0，否则会请求 :6333。
  */
 export function createClient(url: string) {
   const trimmed = url.trim() || DEFAULT_QDRANT_URL
 
   if (trimmed.startsWith('/')) {
+    const origin = new URL(window.location.origin)
     return new QdrantClient({
       url: window.location.origin,
       prefix: trimmed.replace(/^\//, ''),
+      // 0 为 falsy，SDK 拼地址时不会附加端口（沿用 443/80）
+      port: origin.port ? Number(origin.port) : 0,
       checkCompatibility: false,
     })
   }

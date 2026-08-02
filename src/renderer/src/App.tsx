@@ -23,20 +23,19 @@ import {
   type ScrollFilter,
 } from './api/qdrant'
 import {
+  IMPORT_STREAM_THRESHOLD,
   exportCollectionsStreaming,
   formatQdrantError,
   importCollections,
-  normalizeImportData,
-  type ExportCollection,
+  importExportFileStreaming,
+  inspectImportFile,
+  type ImportFilePlan,
 } from './api/transfer'
 import { useDialog } from './dialogs'
 import { IO_TOAST, toast } from './toast'
 import './App.css'
 
-type PendingImport = {
-  fileName: string
-  collections: ExportCollection[]
-}
+type PendingImport = ImportFilePlan & { file: File }
 
 type StorageInfo = {
   path: string
@@ -658,13 +657,17 @@ export default function App() {
   const prepareImport = async (file: File) => {
     if (!connected || ioBusy) return
     try {
-      const text = await file.text()
-      const raw = JSON.parse(text) as unknown
-      const collections = normalizeImportData(raw)
-      if (collections.length === 0) throw new Error('导入文件里没有 collection')
-      setPendingImport({ fileName: file.name, collections })
+      toast.loading(
+        file.size > IMPORT_STREAM_THRESHOLD
+          ? `正在检查大文件（${formatBytes(file.size)}）…`
+          : '正在读取导入文件…',
+        IO_TOAST,
+      )
+      const plan = await inspectImportFile(file)
+      toast.dismiss(IO_TOAST)
+      setPendingImport({ ...plan, file })
     } catch (e) {
-      toast.error(formatQdrantError(e))
+      toast.error(formatQdrantError(e), { id: IO_TOAST })
     } finally {
       if (importInputRef.current) importInputRef.current.value = ''
     }
@@ -672,7 +675,7 @@ export default function App() {
 
   const confirmImport = async (clearPoints: boolean) => {
     if (!pendingImport || ioBusy) return
-    const { collections, fileName } = pendingImport
+    const { fileName, file, stream, parsed } = pendingImport
     setPendingImport(null)
     setIoBusy(true)
     toast.loading(
@@ -682,12 +685,19 @@ export default function App() {
       IO_TOAST,
     )
     try {
-      const results = await importCollections(
-        client,
-        collections,
-        { clearPoints },
-        reportProgress,
-      )
+      const results = stream || !parsed
+        ? await importExportFileStreaming(
+            client,
+            file,
+            { clearPoints },
+            reportProgress,
+          )
+        : await importCollections(
+            client,
+            parsed,
+            { clearPoints },
+            reportProgress,
+          )
       const total = results.reduce((n, r) => n + r.points, 0)
       const reopen = selected
       toast.success(
@@ -1478,18 +1488,27 @@ export default function App() {
             <div className="modal-body">
               <p className="import-summary">
                 文件 <span className="mono">{pendingImport.fileName}</span>
-                ，共 {pendingImport.collections.length} 个 collection、
-                {pendingImport.collections.reduce((n, c) => n + (c.points?.length ?? 0), 0)}{' '}
-                个点。
+                （{formatBytes(pendingImport.fileSize)}）
+                {pendingImport.stream
+                  ? '，大文件将流式导入'
+                  : `，共 ${pendingImport.preview.length} 个 collection、${pendingImport.preview.reduce((n, c) => n + (c.points ?? 0), 0)} 个点`}
+                。
               </p>
               <ul className="import-list">
-                {pendingImport.collections.map((c) => (
+                {pendingImport.preview.map((c) => (
                   <li key={c.name}>
                     <span className="mono">{c.name}</span>
-                    <span className="dim">{c.points?.length ?? 0} 点</span>
+                    <span className="dim">
+                      {c.points == null ? '点数导入时统计' : `${c.points} 点`}
+                    </span>
                   </li>
                 ))}
               </ul>
+              {pendingImport.stream && (
+                <p className="import-hint">
+                  文件较大，不会整包解析 JSON，而是边读边写入，避免「无效格式 / 字符串过长」。
+                </p>
+              )}
               <p className="import-hint">
                 「合并导入」只覆盖同 ID 的点；「清空点后导入」会删光该库里的点再写入，但不会删除
                 collection 本身（避免 Windows 删目录报拒绝访问）。
@@ -1503,7 +1522,7 @@ export default function App() {
                   className="danger"
                   disabled={ioBusy}
                   onClick={() => {
-                    const names = pendingImport.collections.map((c) => c.name).join('、')
+                    const names = pendingImport.preview.map((c) => c.name).join('、')
                     void dialog
                       .confirm({
                         title: '确认清空点后导入',

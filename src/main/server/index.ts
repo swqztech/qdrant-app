@@ -59,6 +59,8 @@ app.get('/api/storage-info', (_req, res) => {
       source: 'error',
       collectionsPath: '',
       collections: [],
+      totalBytes: null,
+      collectionSizes: [],
       note: err instanceof Error ? err.message : String(err)
     })
   }

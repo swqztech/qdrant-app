@@ -364,6 +364,48 @@ button.ghost:hover:not(:disabled) {
   line-height: 1.45;
 }
 
+.storage-size {
+  margin: 8px 0;
+  font-size: 0.86rem;
+  color: var(--text);
+}
+
+.storage-size strong {
+  color: var(--accent-text, #7ec8ff);
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-sizes {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  max-height: 140px;
+  overflow: auto;
+}
+
+.storage-sizes li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.storage-sizes .size-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.storage-sizes .size-val {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
 .storage-copy {
   width: 100%;
   margin-top: 8px;

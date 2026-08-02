@@ -26,11 +26,22 @@ export type ExportBundle = {
 
 export type ProgressFn = (message: string) => void
 
-const SCROLL_BATCH = 256
+const SCROLL_BATCH = 64
 const UPSERT_BATCH = 64
+/** 导出时合并小片段，避免 BlobPart 过多 */
+const EXPORT_FLUSH_EVERY = 40
 
 /** 把 Qdrant / fetch 错误转成可读文案 */
 export function formatQdrantError(err: unknown): string {
+  if (typeof err === 'string') return err
+  if (err instanceof Error) {
+    if (/Invalid string length|string longer than|Maximum call stack/i.test(err.message)) {
+      return '导出数据过大，已切换流式导出仍失败。请只导出单个 collection，或在服务器用 curl 分批导出。'
+    }
+    if (/Failed to fetch|NetworkError|Load failed/i.test(err.message)) {
+      return '网络请求失败（Failed to fetch）。请确认 /qdrant 代理与 Qdrant 服务可用。'
+    }
+  }
   if (!err || typeof err !== 'object') return String(err)
   const e = err as {
     message?: string
@@ -164,16 +175,132 @@ export async function exportCollections(
   }
 }
 
-export function downloadJson(filename: string, data: unknown) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], {
-    type: 'application/json;charset=utf-8',
-  })
+function triggerBlobDownload(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = filename
   a.click()
   URL.revokeObjectURL(url)
+}
+
+export function downloadJson(filename: string, data: unknown) {
+  // 紧凑 JSON，避免 pretty-print 撑爆大库
+  triggerBlobDownload(
+    filename,
+    new Blob([JSON.stringify(data)], {
+      type: 'application/json;charset=utf-8',
+    }),
+  )
+}
+
+class JsonBlobBuilder {
+  private parts: BlobPart[] = []
+  private buf: string[] = []
+  private bufCount = 0
+
+  push(text: string) {
+    this.buf.push(text)
+    this.bufCount += 1
+    if (this.bufCount >= EXPORT_FLUSH_EVERY) this.flush()
+  }
+
+  flush() {
+    if (this.buf.length === 0) return
+    this.parts.push(this.buf.join(''))
+    this.buf = []
+    this.bufCount = 0
+  }
+
+  toBlob() {
+    this.flush()
+    return new Blob(this.parts, { type: 'application/json;charset=utf-8' })
+  }
+}
+
+/**
+ * 流式导出大库：边 scroll 边写入 Blob 分片，避免整包 JSON.stringify 触发
+ * “Invalid string length / 参数过长”之类错误。
+ */
+export async function exportCollectionsStreaming(
+  client: QdrantClient,
+  names: string[],
+  filename: string,
+  onProgress?: ProgressFn,
+): Promise<{ collections: number; points: number; bytes: number }> {
+  if (names.length === 0) throw new Error('没有可导出的 collection')
+
+  const builder = new JsonBlobBuilder()
+  const exportedAt = new Date().toISOString()
+  builder.push(
+    `{"format":${JSON.stringify(EXPORT_FORMAT)},"version":${EXPORT_VERSION},"exportedAt":${JSON.stringify(exportedAt)},"collections":[`,
+  )
+
+  let totalPoints = 0
+
+  for (let ci = 0; ci < names.length; ci += 1) {
+    const name = names[ci]!
+    if (ci > 0) builder.push(',')
+
+    onProgress?.(`读取 collection 配置：${name}`)
+    const info = await client.getCollection(name)
+    const vectors = sanitizeVectorParams(info.config?.params?.vectors ?? null)
+    if (!vectors) {
+      throw new Error(`collection「${name}」的 vectors 配置无效，无法导出`)
+    }
+    const sparseVectors = info.config?.params?.sparse_vectors ?? undefined
+
+    builder.push(`{"name":${JSON.stringify(name)},"vectors":${JSON.stringify(vectors)}`)
+    if (sparseVectors != null) {
+      builder.push(`,"sparseVectors":${JSON.stringify(sparseVectors)}`)
+    }
+    builder.push(`,"points":[`)
+
+    let firstPoint = true
+    let offset: string | number | null | undefined = undefined
+    let count = 0
+
+    for (;;) {
+      const res = await client.scroll(name, {
+        limit: SCROLL_BATCH,
+        offset: offset ?? undefined,
+        with_payload: true,
+        with_vector: true,
+      })
+
+      for (const p of res.points ?? []) {
+        if (!firstPoint) builder.push(',')
+        firstPoint = false
+        builder.push(
+          JSON.stringify({
+            id: p.id,
+            payload: p.payload ?? null,
+            vector: p.vector ?? null,
+          }),
+        )
+        count += 1
+      }
+
+      onProgress?.(`导出 ${name}：已写入 ${count.toLocaleString()} 个点…`)
+      const next = res.next_page_offset
+      if (next === undefined || next === null) break
+      offset = next as string | number
+    }
+
+    builder.push(']}')
+    totalPoints += count
+  }
+
+  builder.push(']}')
+  onProgress?.('正在打包下载文件…')
+  const blob = builder.toBlob()
+  triggerBlobDownload(filename, blob)
+
+  return {
+    collections: names.length,
+    points: totalPoints,
+    bytes: blob.size,
+  }
 }
 
 function isExportBundle(value: unknown): value is ExportBundle {

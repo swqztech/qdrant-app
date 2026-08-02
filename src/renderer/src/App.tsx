@@ -23,8 +23,7 @@ import {
   type ScrollFilter,
 } from './api/qdrant'
 import {
-  downloadJson,
-  exportCollections,
+  exportCollectionsStreaming,
   formatQdrantError,
   importCollections,
   normalizeImportData,
@@ -45,7 +44,22 @@ type StorageInfo = {
   source: string
   collectionsPath: string
   collections: string[]
+  totalBytes?: number | null
+  collectionSizes?: { name: string; bytes: number }[]
   note?: string
+}
+
+function formatBytes(bytes: number | null | undefined) {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return '—'
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let n = bytes
+  let i = -1
+  do {
+    n /= 1024
+    i += 1
+  } while (n >= 1024 && i < units.length - 1)
+  return `${n.toFixed(n >= 100 || i === 0 ? 1 : 2)} ${units[i]}`
 }
 
 const PAGE_SIZE = 20
@@ -586,16 +600,20 @@ export default function App() {
     setIoBusy(true)
     toast.loading('准备导出…', IO_TOAST)
     try {
-      const bundle = await exportCollections(client, names, reportProgress)
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
       const filename =
         names.length === 1
           ? `qdrant-${names[0]}-${stamp}.json`
           : `qdrant-all-${stamp}.json`
-      downloadJson(filename, bundle)
-      const total = bundle.collections.reduce((n, c) => n + c.points.length, 0)
+      // 流式写出，避免大库 JSON.stringify 报「长度太长」
+      const result = await exportCollectionsStreaming(
+        client,
+        names,
+        filename,
+        reportProgress,
+      )
       toast.success(
-        `导出完成：${bundle.collections.length} 个 collection，共 ${total} 个点 → ${filename}`,
+        `导出完成：${result.collections} 个库，共 ${result.points.toLocaleString()} 点 · ${formatBytes(result.bytes)} → ${filename}`,
         { id: IO_TOAST },
       )
     } catch (e) {
@@ -833,10 +851,22 @@ export default function App() {
                   来源：{storageInfo.source}
                   {storageInfo.exists ? ' · 已找到' : ' · 路径不存在'}
                 </p>
-                {storageInfo.collections.length > 0 && (
-                  <p className="storage-meta">
-                    磁盘 collections：{storageInfo.collections.join('、')}
+                {storageInfo.exists && (
+                  <p className="storage-size">
+                    磁盘占用：<strong>{formatBytes(storageInfo.totalBytes)}</strong>
                   </p>
+                )}
+                {storageInfo.collectionSizes && storageInfo.collectionSizes.length > 0 && (
+                  <ul className="storage-sizes">
+                    {storageInfo.collectionSizes.map((c) => (
+                      <li key={c.name}>
+                        <span className="size-name" title={c.name}>
+                          {c.name}
+                        </span>
+                        <span className="size-val">{formatBytes(c.bytes)}</span>
+                      </li>
+                    ))}
+                  </ul>
                 )}
                 {storageInfo.note && <p className="storage-meta">{storageInfo.note}</p>}
                 <button
@@ -848,7 +878,9 @@ export default function App() {
                 </button>
               </>
             ) : (
-              <p className="empty">未能读取本地存储路径（需通过 npm run dev 启动）</p>
+              <p className="empty">
+                未能读取本地存储路径。服务器请设置 QDRANT_STORAGE_PATH 后重启。
+              </p>
             )}
           </div>
         </aside>
@@ -884,6 +916,15 @@ export default function App() {
                   <div className="stat">
                     <span className="label">Segments</span>
                     <span className="value">{detail.segmentsCount}</span>
+                  </div>
+                  <div className="stat">
+                    <span className="label">磁盘占用</span>
+                    <span className="value">
+                      {formatBytes(
+                        storageInfo?.collectionSizes?.find((c) => c.name === detail.name)
+                          ?.bytes,
+                      )}
+                    </span>
                   </div>
                   <div className="stat">
                     <span className="label">Payload 索引</span>

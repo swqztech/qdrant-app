@@ -27,12 +27,29 @@ export type ExportBundle = {
 export type ProgressFn = (message: string) => void
 
 const SCROLL_BATCH = 64
-const UPSERT_BATCH = 64
+/** 导入批次不宜过大：512 维向量时 32 点约数百 KB，降低代理/网关压力 */
+const UPSERT_BATCH = 32
+/** 每写入若干批后做一次轻量探活，避免长时间无响应被中间层掐断 */
+const UPSERT_HEALTH_EVERY = 16
+const UPSERT_MAX_ATTEMPTS = 8
 /** 导出时合并小片段，避免 BlobPart 过多 */
 const EXPORT_FLUSH_EVERY = 40
 
 /** 超过此大小走流式导入，避免 file.text() / JSON.parse 触发 Invalid string length */
-export const IMPORT_STREAM_THRESHOLD = 24 * 1024 * 1024
+export const IMPORT_STREAM_THRESHOLD = 4 * 1024 * 1024
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+function isTransientNetworkError(err: unknown): boolean {
+  const msg = formatQdrantError(err)
+  return /Failed to fetch|NetworkError|Load failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|timeout|超时|502|503|504|429|Unavailable|Bad gateway|service unavailable|不可连接|连接被重置|网络请求失败|signal is aborted|AbortError|aborted without reason|请求被中止/i.test(
+    msg,
+  )
+}
 
 /** 把 Qdrant / fetch 错误转成可读文案 */
 export function formatQdrantError(err: unknown): string {
@@ -41,8 +58,14 @@ export function formatQdrantError(err: unknown): string {
     if (/Invalid string length|string longer than|Maximum call stack/i.test(err.message)) {
       return '文件过大，浏览器无法整文件解析。请重新选择该文件（将自动改用流式导入），或拆成更小的导出后再试。'
     }
-    if (/Failed to fetch|NetworkError|Load failed/i.test(err.message)) {
-      return '网络请求失败（Failed to fetch）。请确认 /qdrant 代理与 Qdrant 服务可用。'
+    if (/Unexpected end of JSON input|Unexpected token|is not valid JSON/i.test(err.message)) {
+      return 'JSON 解析失败：文件可能不完整或不是本工具导出的格式。请重新导出后再导入（大文件会自动流式读取）。'
+    }
+    if (/Failed to fetch|NetworkError|Load failed|ECONNREFUSED|ECONNRESET/i.test(err.message)) {
+      return '服务暂时不可连接（网络中断或 Qdrant/代理过载）。导入会自动重试；若仍失败请稍后再试或检查 Qdrant 是否在运行。'
+    }
+    if (/signal is aborted|AbortError|aborted without reason/i.test(err.message)) {
+      return '请求被中止（超时或连接中断）。请确认 Qdrant 已启动，地址填写 /qdrant 或 http://127.0.0.1:6333 后重试连接。'
     }
   }
   if (!err || typeof err !== 'object') return String(err)
@@ -359,6 +382,8 @@ function findJsonValueEnd(s: string, start: number): number | null {
     while (i < n) {
       const c = s[i]!
       if (c === '\\') {
+        // 转义被截断时继续读下一块
+        if (i + 1 >= n) return null
         i += 2
         continue
       }
@@ -377,6 +402,7 @@ function findJsonValueEnd(s: string, start: number): number | null {
       const c = s[i]!
       if (inStr) {
         if (c === '\\') {
+          if (i + 1 >= n) return null
           i += 2
           continue
         }
@@ -399,9 +425,11 @@ function findJsonValueEnd(s: string, start: number): number | null {
     return null
   }
 
-  // number / true / false / null
+  // number / true / false / null：必须读到分隔符才算完整，避免缓冲区边界误切
+  const litStart = i
   while (i < n && !/[\s,\]}]/.test(s[i]!)) i += 1
-  return i > start ? i : null
+  if (i >= n) return null
+  return i > litStart ? i : null
 }
 
 function skipWs(s: string, i: number): number {
@@ -424,8 +452,33 @@ export type ImportFilePlan = {
   parsed: ExportCollection[] | null
 }
 
+/** 读取文件头，判断是否为本工具导出格式 */
+async function readExportHead(file: File, size = 8192): Promise<string> {
+  const headSize = Math.min(file.size, size)
+  if (headSize <= 0) return ''
+  return (await file.slice(0, headSize).text()).replace(/^\uFEFF/, '')
+}
+
+function looksLikeOurExport(head: string): boolean {
+  return /"format"\s*:\s*"qdrant-viewer-export"/.test(head)
+}
+
+/** 粗检文件是否被截断（导出 JSON 应以 } 结尾） */
+async function assertExportNotTruncated(file: File): Promise<void> {
+  if (file.size < 2) {
+    throw new Error('文件为空，无法导入。')
+  }
+  const tailSize = Math.min(file.size, 128)
+  const tail = (await file.slice(file.size - tailSize).text()).trimEnd()
+  if (!/\}\s*$/.test(tail)) {
+    throw new Error(
+      '导出文件似乎不完整（未以 } 结尾）。请重新导出后再导入；下载时请等到浏览器显示完成。',
+    )
+  }
+}
+
 /**
- * 检查导入文件：小文件整包解析；大文件只校验头部并走流式导入。
+ * 检查导入文件：本工具导出格式（或较大文件）走流式；仅很小的完整 JSON 才整包解析。
  */
 export async function inspectImportFile(file: File): Promise<ImportFilePlan> {
   const base = {
@@ -433,8 +486,17 @@ export async function inspectImportFile(file: File): Promise<ImportFilePlan> {
     fileSize: file.size,
   }
 
-  const tryMemory = file.size <= IMPORT_STREAM_THRESHOLD
-  if (tryMemory) {
+  if (file.size <= 0) {
+    throw new Error('文件为空，无法导入。')
+  }
+
+  const head = await readExportHead(file)
+  const ourExport = looksLikeOurExport(head)
+
+  // 本工具导出 / 超过阈值：一律流式，避免大文件 JSON.parse → Unexpected end of JSON input
+  const forceStream = ourExport || file.size > IMPORT_STREAM_THRESHOLD
+
+  if (!forceStream) {
     try {
       const text = await file.text()
       const collections = normalizeImportData(JSON.parse(text) as unknown)
@@ -450,13 +512,25 @@ export async function inspectImportFile(file: File): Promise<ImportFilePlan> {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (!/Invalid string length|string longer than|Out of memory/i.test(msg)) {
+      // 解析失败时若头部像导出文件，回退流式；否则给出可读错误
+      if (
+        !ourExport &&
+        !/Invalid string length|string longer than|Out of memory|Unexpected end of JSON|is not valid JSON|JSON/i.test(
+          msg,
+        )
+      ) {
         throw err
+      }
+      if (!ourExport && /Unexpected end of JSON|is not valid JSON/i.test(msg)) {
+        throw new Error(
+          'JSON 解析失败：文件可能不完整。请确认选择的是完整导出文件。',
+        )
       }
       // 回退流式
     }
   }
 
+  await assertExportNotTruncated(file)
   const preview = await peekExportBundle(file)
   return {
     ...base,
@@ -469,16 +543,12 @@ export async function inspectImportFile(file: File): Promise<ImportFilePlan> {
 /** 只读文件头部，校验 format 并取出第一个 collection 的 name（用于确认框） */
 async function peekExportBundle(file: File): Promise<ImportPreviewCollection[]> {
   const headSize = Math.min(file.size, 1024 * 1024)
-  const head = await file.slice(0, headSize).text()
-  const trimmed = head.replace(/^\uFEFF/, '')
+  const trimmed = (await file.slice(0, headSize).text()).replace(/^\uFEFF/, '')
 
-  if (!trimmed.includes(`"format":"${EXPORT_FORMAT}"`)) {
-    // 兼容有空格的 pretty JSON
-    if (!/"format"\s*:\s*"qdrant-viewer-export"/.test(trimmed)) {
-      throw new Error(
-        '无法识别的导入文件（缺少 format: qdrant-viewer-export）。请使用本工具导出的 JSON。',
-      )
-    }
+  if (!looksLikeOurExport(trimmed)) {
+    throw new Error(
+      '无法识别的导入文件（缺少 format: qdrant-viewer-export）。请使用本工具导出的 JSON。',
+    )
   }
 
   const marker = '"collections"'
@@ -695,11 +765,13 @@ export async function importExportFileStreaming(
   const results: { name: string; points: number }[] = []
   let current: StreamCollMeta | null = null
   let written = 0
+  let batchIndex = 0
 
   for await (const ev of iterateExportFile(file)) {
     if (ev.type === 'collection') {
       current = ev.meta
       written = 0
+      batchIndex = 0
       const col: ExportCollection = {
         name: current.name,
         vectors: current.vectors,
@@ -717,25 +789,35 @@ export async function importExportFileStreaming(
     } else if (ev.type === 'points') {
       if (!current) throw new Error('导入状态异常：尚未进入 collection')
       try {
-        await client.upsert(current.name, {
-          wait: true,
-          points: ev.points.map((p) => ({
-            id: p.id,
-            vector: (p.vector ?? undefined) as never,
-            payload: p.payload ?? undefined,
-          })),
-        })
+        await upsertPointsReliable(client, current.name, ev.points, onProgress)
       } catch (err) {
         throw new Error(
-          `写入「${current.name}」失败（已处理 ${written}）：${formatQdrantError(err)}`,
+          `写入「${current.name}」失败（已处理 ${written.toLocaleString()} 个点）：${formatQdrantError(err)}。可稍后对同一文件再执行「合并导入」续传。`,
         )
       }
       written += ev.points.length
+      batchIndex += 1
+      if (batchIndex % UPSERT_HEALTH_EVERY === 0) {
+        try {
+          await pingDuringImport(client, current.name, onProgress)
+        } catch (err) {
+          throw new Error(
+            `写入「${current.name}」后探活失败（已处理 ${written.toLocaleString()} 个点）：${formatQdrantError(err)}。可稍后合并导入续传。`,
+          )
+        }
+      }
       onProgress?.(
         `导入 ${current.name}：已写入 ${written.toLocaleString()} 个点…`,
       )
     } else if (ev.type === 'collection-end') {
       if (current) {
+        // 收尾确认 collection 仍可访问
+        try {
+          await pingDuringImport(client, current.name, onProgress)
+        } catch {
+          // 点多半已写入，不因收尾探活失败整单失败
+          onProgress?.(`「${current.name}」已写入 ${written.toLocaleString()} 点（收尾探活未响应）`)
+        }
         results.push({ name: current.name, points: written })
         current = null
       }
@@ -754,6 +836,64 @@ export type ImportOptions = {
    * false：直接 upsert 合并
    */
   clearPoints: boolean
+}
+
+/**
+ * 可靠写入一批点：wait:false 避免每批阻塞到落盘/索引（易触发网关超时），
+ * 遇短暂断连自动退避重试。
+ */
+async function upsertPointsReliable(
+  client: QdrantClient,
+  collection: string,
+  points: ExportPoint[],
+  onProgress?: ProgressFn,
+): Promise<void> {
+  const mapped = points.map((p) => ({
+    id: p.id,
+    vector: (p.vector ?? undefined) as never,
+    payload: p.payload ?? undefined,
+  }))
+
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= UPSERT_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await client.upsert(collection, {
+        wait: false,
+        points: mapped,
+      })
+      return
+    } catch (err) {
+      lastErr = err
+      if (!isTransientNetworkError(err) || attempt >= UPSERT_MAX_ATTEMPTS) {
+        throw err
+      }
+      const delay = Math.min(800 * 2 ** (attempt - 1), 20_000)
+      onProgress?.(
+        `写入暂时失败，${Math.ceil(delay / 1000)}s 后重试（${attempt}/${UPSERT_MAX_ATTEMPTS}）…`,
+      )
+      await sleep(delay)
+    }
+  }
+  throw lastErr
+}
+
+/** 导入过程中的轻量探活，失败则短暂等待再试 */
+async function pingDuringImport(
+  client: QdrantClient,
+  collection: string,
+  onProgress?: ProgressFn,
+): Promise<void> {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      await client.getCollection(collection)
+      return
+    } catch (err) {
+      if (!isTransientNetworkError(err) || attempt >= 4) throw err
+      const delay = 1000 * attempt
+      onProgress?.(`服务忙碌，等待 ${delay / 1000}s 后继续…`)
+      await sleep(delay)
+    }
+  }
 }
 
 function isOrphanCreateError(err: unknown): boolean {
@@ -863,21 +1003,25 @@ export async function importCollections(
     }
 
     const points = col.points ?? []
+    let batchIndex = 0
     for (let i = 0; i < points.length; i += UPSERT_BATCH) {
       const chunk = points.slice(i, i + UPSERT_BATCH)
       try {
-        await client.upsert(col.name, {
-          wait: true,
-          points: chunk.map((p) => ({
-            id: p.id,
-            vector: (p.vector ?? undefined) as never,
-            payload: p.payload ?? undefined,
-          })),
-        })
+        await upsertPointsReliable(client, col.name, chunk, onProgress)
       } catch (err) {
         throw new Error(
-          `写入「${col.name}」失败（已处理 ${i}/${points.length}）：${formatQdrantError(err)}`,
+          `写入「${col.name}」失败（已处理 ${i}/${points.length}）：${formatQdrantError(err)}。可稍后合并导入续传。`,
         )
+      }
+      batchIndex += 1
+      if (batchIndex % UPSERT_HEALTH_EVERY === 0) {
+        try {
+          await pingDuringImport(client, col.name, onProgress)
+        } catch (err) {
+          throw new Error(
+            `写入「${col.name}」后探活失败（已处理 ${i + chunk.length}/${points.length}）：${formatQdrantError(err)}`,
+          )
+        }
       }
       onProgress?.(
         `导入 ${col.name}：${Math.min(i + chunk.length, points.length)} / ${points.length}`,

@@ -36,7 +36,10 @@ function ensureQdrantProxy() {
     createProxyMiddleware({
       target: qdrantTarget,
       changeOrigin: true,
-      pathRewrite: { '^/qdrant': '' }
+      pathRewrite: { '^/qdrant': '' },
+      // 大库导入时单请求可能较久，避免代理过早断开导致「服务不可连接」
+      timeout: 0,
+      proxyTimeout: 10 * 60 * 1000,
     })
   )
 }

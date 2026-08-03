@@ -32,7 +32,8 @@ export default defineConfig({
         '/qdrant': {
           target: 'http://127.0.0.1:6333',
           changeOrigin: true,
-          rewrite: (p) => p.replace(/^\/qdrant/, '')
+          rewrite: (p) => p.replace(/^\/qdrant/, ''),
+          timeout: 600_000
         }
       }
     }

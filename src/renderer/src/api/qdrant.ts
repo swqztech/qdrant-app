@@ -14,6 +14,9 @@ export const DEFAULT_QDRANT_URL = '/qdrant'
 export function createClient(url: string) {
   const trimmed = url.trim() || DEFAULT_QDRANT_URL
 
+  // 注意：构造函数 timeout 单位是毫秒（默认 300000）；单次请求参数才是秒
+  const timeoutMs = 600_000
+
   if (trimmed.startsWith('/')) {
     const origin = new URL(window.location.origin)
     return new QdrantClient({
@@ -22,12 +25,14 @@ export function createClient(url: string) {
       // 0 为 falsy，SDK 拼地址时不会附加端口（沿用 443/80）
       port: origin.port ? Number(origin.port) : 0,
       checkCompatibility: false,
+      timeout: timeoutMs,
     })
   }
 
   return new QdrantClient({
     url: trimmed,
     checkCompatibility: false,
+    timeout: timeoutMs,
   })
 }
 

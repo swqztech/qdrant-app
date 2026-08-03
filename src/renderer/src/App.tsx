@@ -699,17 +699,38 @@ export default function App() {
             reportProgress,
           )
       const total = results.reduce((n, r) => n + r.points, 0)
-      const reopen = selected
+      const reopen =
+        selected && results.some((r) => r.name === selected)
+          ? selected
+          : (results[0]?.name ?? null)
       toast.success(
         `导入完成（${clearPoints ? '已清空原有点后写入' : '已合并，未清空原有数据'}）：` +
           `${results.map((r) => `${r.name}(${r.points})`).join('、')}，共 ${total} 个点`,
         { id: IO_TOAST },
       )
-      await connect(url, {
-        select: reopen && results.some((r) => r.name === reopen) ? reopen : null,
-      })
+      // 软刷新：勿走 connect()，避免 Qdrant 刚忙完时探活失败被打成「未连接」
+      try {
+        const cols = await listCollections(client)
+        setCollections(cols)
+        setConnected(true)
+        void loadStorageInfo()
+        if (reopen && cols.some((c) => c.name === reopen)) {
+          await loadCollection(reopen, { resetQuery: true, filter: null })
+        }
+      } catch {
+        toast.info('导入已完成，列表刷新失败，请手动点「刷新」', { id: IO_TOAST })
+      }
     } catch (e) {
       toast.error(formatQdrantError(e), { id: IO_TOAST })
+      // 部分点可能已写入，尝试刷新状态，但失败时不要强制 setConnected(false)
+      try {
+        const cols = await listCollections(client)
+        setCollections(cols)
+        setConnected(true)
+        if (selected) await loadCollection(selected)
+      } catch {
+        // 保持当前 UI，用户可手动重连
+      }
     } finally {
       setIoBusy(false)
     }
